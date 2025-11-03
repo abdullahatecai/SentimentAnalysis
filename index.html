@@ -573,7 +573,7 @@
 
     <script>
         // Configuration - ngrok tunnel to local n8n
-        const N8N_WEBHOOK_URL = 'https://n884670.app.n8n.cloud/webhook-test/analyze-reviews-sentiments';
+        const N8N_WEBHOOK_URL = 'https://n884670.app.n8n.cloud/webhook/analyze-reviews-sentiments';
 
         let autocompleteService;
         let placesService;
@@ -684,7 +684,7 @@
                 return;
             }
             try {
-                const res = await fetch('https://n884670.app.n8n.cloud/webhook-test/places-autocomplete-sentiments', {
+                const res = await fetch('https://n884670.app.n8n.cloud/webhook/places-autocomplete-sentiments', {
                     method: 'POST', 
                     headers: { 
                         'Content-Type': 'application/json'
@@ -757,7 +757,7 @@
         // Find place by text search
         async function findPlaceByText(query) {
             try {
-                const res = await fetch('https://n884670.app.n8n.cloud/webhook-test/place-search-sentiments', {
+                const res = await fetch('https://n884670.app.n8n.cloud/webhook/place-search-sentiments', {
                     method: 'POST', 
                     headers: { 
                         'Content-Type': 'application/json'
