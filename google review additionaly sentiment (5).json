@@ -1,0 +1,661 @@
+{
+  "name": "Google Review",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "analyze-reviews-sentiments",
+        "responseMode": "responseNode",
+        "options": {
+          "allowedOrigins": "*",
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Access-Control-Allow-Origin",
+                "value": " *"
+              },
+              {
+                "name": "Access-Control-Allow-Methods",
+                "value": "POST, OPTIONS, GET"
+              },
+              {
+                "name": "Access-Control-Allow-Headers",
+                "value": "Content-Type"
+              }
+            ]
+          }
+        }
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -2080,
+        -144
+      ],
+      "id": "3038133b-71fb-49e0-8ede-679c3342f9c7",
+      "name": "Webhook",
+      "webhookId": "8eff5211-e331-4605-940d-9b7f9701bfc0"
+    },
+    {
+      "parameters": {
+        "url": "https://maps.googleapis.com/maps/api/place/details/json",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "place_id",
+              "value": "={{ $json.body.place_id }}"
+            },
+            {
+              "name": "fields",
+              "value": "name,rating,reviews,formatted_address,user_ratings_total,photos,website,formatted_phone_number"
+            },
+            {
+              "name": "key",
+              "value": "={{ $env.GOOGLE_PLACES_API_KEY }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -1840,
+        -144
+      ],
+      "id": "f3f858e6-0507-4d35-a453-2c7a70b78a0b",
+      "name": "HTTP Request"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://language.googleapis.com/v1/documents:analyzeSentiment",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "googleCloudNaturalLanguageOAuth2Api",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ $json.requestBody }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -1040,
+        -144
+      ],
+      "id": "e8b09775-5ba8-4f73-831b-f806975e4e6e",
+      "name": "Sentiments Analysis",
+      "credentials": {
+        "googleCloudNaturalLanguageOAuth2Api": {
+          "id": "MM9erA9GUBdGEpCy",
+          "name": "Google Cloud Natural Language account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// This node ensures consistent data structure for Google NLP and preserves place-level fields (per-item)\nconst inputData = $json;\n\n// Extract review text safely (no placeholders)\nlet reviewText = '';\nif (inputData.review && typeof inputData.review.text === 'string') {\n  reviewText = inputData.review.text;\n} else if (typeof inputData.text === 'string') {\n  reviewText = inputData.text;\n}\n\n// Unicode-safe cleaning: remove control chars only; keep Arabic and all letters\nconst cleanText = String(reviewText)\n  .replace(/[\\u0000-\\u001F\\u007F]/g, ' ') // control chars\n  .replace(/\\s+/g, ' ')\n  .trim();\n\n// Return properly structured request with pass-through fields (single item)\nreturn {\n  place_name: inputData.place_name,\n  address: inputData.address || '',\n  rating: inputData.rating || 0,\n  total_reviews: inputData.total_reviews || 0,\n  photo_url: inputData.photo_url || null,\n  website: inputData.website || null,\n  phone: inputData.phone || null,\n  review: {\n    author_name: inputData.review?.author_name || 'Unknown',\n    rating: inputData.review?.rating || 0,\n    text: cleanText,\n    relative_time_description: inputData.review?.relative_time_description || ''\n  },\n  metadata: {\n    place_name: inputData.place_name,\n    review_author: inputData.review?.author_name || 'Unknown',\n    review_rating: inputData.review?.rating || 0\n  },\n  api_request: {\n    document: {\n      content: cleanText,\n      type: \"PLAIN_TEXT\"\n    },\n    encodingType: \"UTF8\"\n  }\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1472,
+        -144
+      ],
+      "id": "664afb2a-2457-47fb-8adc-f42a346c92b6",
+      "name": "Iterate over reviews"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Node 5: Aggregate Individual Review Sentiments (FIXED VERSION)\nconst allProcessedItems = $input.all();\n\nconsole.log('Total items received:', allProcessedItems.length);\n\n// Group by place - process ALL items\nconst places = {};\n\nallProcessedItems.forEach(item => {\n  // Get place key from available sources\n  const placeKey = item.json.place_name || item.json.metadata?.place_name || 'Unknown Place';\n  \n  if (!places[placeKey]) {\n    places[placeKey] = {\n      place_name: placeKey,\n      address: item.json.address || '',\n      rating: item.json.rating || 0,\n      total_reviews: item.json.total_reviews || 0,\n      photo_url: item.json.photo_url || null,     // ✅ ADDED\n      website: item.json.website || null,         // ✅ ADDED\n      phone: item.json.phone || null,  \n      reviews: [],\n      sentiment_analysis: { positive: 0, negative: 0, neutral: 0 },\n      sentiment_scores: [],\n      raw_reviews: [] // Store reviews without sentiment analysis\n    };\n  }\n  \n  // Extract data from the new structure\n  const reviewData = item.json.review; // Now has author_name, rating, etc.\n  const sentimentData = item.json.documentSentiment;\n  const hasSentiment = !!sentimentData;\n  \n  // Extract basic review information\n  const baseReview = {\n    // Original review content\n    author_name: reviewData?.author_name || item.json.metadata?.review_author || 'Unknown',\n    rating: reviewData?.rating || item.json.metadata?.review_rating || 0,\n    text: reviewData?.text || item.json.requestBody?.document?.content || '',\n    relative_time_description: reviewData?.relative_time_description || '',\n    time: reviewData?.time || 0,\n    place_name: placeKey\n  };\n  \n  if (hasSentiment) {\n    // Process sentiment analysis results\n    const sentimentScore = sentimentData?.score || 0;\n    const sentimentLabel = sentimentScore > 0.1 ? 'Positive' : \n                          sentimentScore < -0.1 ? 'Negative' : 'Neutral';\n    \n    // Add to sentiment counts\n    places[placeKey].sentiment_analysis[sentimentLabel.toLowerCase()]++;\n    places[placeKey].sentiment_scores.push(sentimentScore);\n    \n    // Create analyzed review with sentiment data\n    const analyzedReview = {\n      ...baseReview,\n      // Sentiment analysis results\n      sentiment: sentimentLabel,\n      sentiment_score: sentimentScore,\n      sentiment_magnitude: sentimentData?.magnitude || 0,\n      // Additional insights\n      sentence_analysis: item.json.sentences || [],\n      has_sentiment_analysis: true\n    };\n    \n    places[placeKey].reviews.push(analyzedReview);\n  } else {\n    // Store review without sentiment analysis\n    const rawReview = {\n      ...baseReview,\n      sentiment: 'Not Analyzed',\n      sentiment_score: 0,\n      sentiment_magnitude: 0,\n      has_sentiment_analysis: false\n    };\n    \n    places[placeKey].raw_reviews.push(rawReview);\n  }\n});\n\n// Calculate overall metrics for each place\nconst results = Object.values(places).map(place => {\n  const totalAnalyzed = place.reviews.length;\n  const totalRaw = place.raw_reviews.length;\n  const totalAllReviews = totalAnalyzed + totalRaw;\n  \n  // Calculate average sentiment score only from analyzed reviews\n  const avgSentimentScore = place.sentiment_scores.length > 0 ?\n    place.sentiment_scores.reduce((sum, score) => sum + score, 0) / place.sentiment_scores.length : 0;\n  \n  // Convert to 0-10 scale\n  const overallScore = ((avgSentimentScore + 1) / 2) * 10;\n  const overallSentiment = avgSentimentScore > 0.1 ? 'Positive' : \n                          avgSentimentScore < -0.1 ? 'Negative' : 'Neutral';\n\n  // Combine analyzed and raw reviews for complete picture\n  const allReviews = [\n    ...place.reviews,\n    ...place.raw_reviews\n  ];\n\n  const obj = {\n    place_name: place.place_name,\n    address: place.address,\n    rating: place.rating,\n    total_reviews: place.total_reviews,\n    photo_url: place.photo_url,      // ✅ ADDED\n    website: place.website,          // ✅ ADDED\n    phone: place.phone,              // ✅ ADDED\n    analyzed_reviews_count: totalAnalyzed,\n    unanalyzed_reviews_count: totalRaw,\n    total_processed_reviews: totalAllReviews,\n    overall_sentiment: totalAnalyzed > 0 ? overallSentiment : 'Not Enough Data',\n    overall_sentiment_score: totalAnalyzed > 0 ? Math.round(overallScore * 10) / 10 : 0,\n    google_avg_sentiment: totalAnalyzed > 0 ? Math.round(avgSentimentScore * 100) / 100 : 0,\n    sentiment_analysis: place.sentiment_analysis,\n    sentiment_breakdown: {\n      positive: {\n        count: place.sentiment_analysis.positive,\n        percentage: totalAnalyzed > 0 ? (place.sentiment_analysis.positive / totalAnalyzed * 100).toFixed(1) + '%' : '0%'\n      },\n      neutral: {\n        count: place.sentiment_analysis.neutral,\n        percentage: totalAnalyzed > 0 ? (place.sentiment_analysis.neutral / totalAnalyzed * 100).toFixed(1) + '%' : '0%'\n      },\n      negative: {\n        count: place.sentiment_analysis.negative,\n        percentage: totalAnalyzed > 0 ? (place.sentiment_analysis.negative / totalAnalyzed * 100).toFixed(1) + '%' : '0%'\n      }\n    },\n    // Return all reviews but mark which ones have sentiment analysis\n    all_reviews: allReviews.sort((a, b) => {\n      // Sort analyzed reviews by sentiment strength first, then raw reviews\n      if (a.has_sentiment_analysis && !b.has_sentiment_analysis) return -1;\n      if (!a.has_sentiment_analysis && b.has_sentiment_analysis) return 1;\n      if (a.has_sentiment_analysis && b.has_sentiment_analysis) {\n        return Math.abs(b.sentiment_score) - Math.abs(a.sentiment_score);\n      }\n      return 0;\n    }),\n    // Only analyzed reviews for sentiment-specific operations\n    analyzed_reviews: place.reviews.sort((a, b) => Math.abs(b.sentiment_score) - Math.abs(a.sentiment_score)),\n    strongest_positive_review: place.reviews.filter(r => r.sentiment === 'Positive')\n      .sort((a, b) => b.sentiment_score - a.sentiment_score)[0] || null,\n    strongest_negative_review: place.reviews.filter(r => r.sentiment === 'Negative')\n      .sort((a, b) => a.sentiment_score - b.sentiment_score)[0] || null,\n    confidence_score: totalAnalyzed > 0 ? \n      Math.round(place.sentiment_scores.reduce((sum, score) => sum + Math.abs(score), 0) / totalAnalyzed * 100) / 100 : 0,\n    analysis_coverage: totalAllReviews > 0 ? \n      Math.round((totalAnalyzed / totalAllReviews) * 100) + '%' : '0%'\n  };\n  // Aliases for frontend compatibility\n  obj.sentiment_score = obj.overall_sentiment_score;\n  obj.reviews = obj.all_reviews;\n  return obj;\n});\n\nconsole.log('Final aggregation complete. Places processed:', results.length);\nresults.forEach(result => {\n  console.log(`Place: ${result.place_name}, Analyzed: ${result.analyzed_reviews_count}, Total: ${result.total_processed_reviews}`);\n});\n\nreturn results;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -672,
+        -144
+      ],
+      "id": "b80122fd-6bfc-4f8d-8b1e-c6c4ba643398",
+      "name": "Review Analysis",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        576,
+        -144
+      ],
+      "id": "28a1674c-329f-4ac8-9377-0ec8c5d39ec0",
+      "name": "Respond to Webhook"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const inputData = $json;\n\nconst requestBody = {\n  document: {\n    content: inputData.api_request.document.content,\n    type: inputData.api_request.document.type\n  },\n  encodingType: inputData.api_request.encodingType\n};\n\n// Store metadata\nconst metadata = {\n  place_name: inputData.metadata.place_name,\n  review_author: inputData.metadata.review_author,\n  review_rating: inputData.metadata.review_rating,\n  review_text: inputData.api_request.document.content\n};\n\n// IMPORTANT: return a SINGLE object in per-item mode\nreturn {\n  requestBody,\n  _metadata: metadata,\n  _review: {\n    author_name: inputData.metadata.review_author,\n    rating: inputData.metadata.review_rating,\n    text: inputData.api_request.document.content,\n    place_name: inputData.metadata.place_name,\n    relative_time_description: inputData.review?.relative_time_description || ''\n  },\n  _place_name: inputData.metadata.place_name,\n  address: inputData.address || '',\n  rating: inputData.rating || 0,\n  total_reviews: inputData.total_reviews || 0\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1232,
+        -144
+      ],
+      "id": "899f95d8-5617-4bfb-a950-4fbe90726da5",
+      "name": "JsonBodyAnalyzeText"
+    },
+    {
+      "parameters": {
+        "jsCode": "// After Sentiment Analysis: merge each sentiment with its matching original item (all-items mode)\nconst sentiments = $input.all(); // array of items from previous node\n\nreturn sentiments.map((sentItem, idx) => {\n  const sentimentResult = sentItem.json;\n\n  // Get matching original item by index from JsonBodyAnalyzeText\n  const original = $items('JsonBodyAnalyzeText', 0)[idx]?.json || {};\n  const metadata = original._metadata || {};\n  const review = original._review || {};\n  const placeName = original._place_name || metadata.place_name || review.place_name || 'Unknown Place';\n\n  // Decide whether to skip sentiment (empty or placeholder text)\n  const textForAnalysis = (review.text || '').trim();\n  const shouldSkip = !textForAnalysis || textForAnalysis.toLowerCase() === 'no review text available';\n\n  const base = {\n    place_name: placeName,\n    address: original.address || '',\n    rating: original.rating || 0,\n    total_reviews: original.total_reviews || 0,\n    review: {\n      author_name: review.author_name || 'Unknown',\n      rating: review.rating || 0,\n      text: review.text || '',\n      relative_time_description: review.relative_time_description || ''\n    },\n    metadata\n  };\n\n  if (shouldSkip) {\n    // Return without documentSentiment so aggregator treats it as unanalyzed\n    return base;\n  }\n\n  return {\n    ...base,\n    documentSentiment: sentimentResult.documentSentiment,\n    language: sentimentResult.language,\n    sentences: sentimentResult.sentences\n  };\n});"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -864,
+        -144
+      ],
+      "id": "adebfadc-b6d7-4621-a1e7-e1f66b6c249d",
+      "name": "MetaData"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Node 3 - With \"Run once for each item\" DISABLED\nconst placeData = $input.all()[0].json.result;\n\nconst reviews = placeData.reviews || [];\n\n// Get photo reference and build photo URL\nconst photos = placeData.photos || [];\nconst photoReference = photos.length > 0 ? photos[0].photo_reference : null;\nconst photoUrl = photoReference ? `https://maps.googleapis.com/maps/api/place/photo?maxwidth=800&photo_reference=${photoReference}&key=${process.env.GOOGLE_PLACES_API_KEY}` : null;\n\n// Return the entire array - n8n will split it automatically\nreturn reviews.map(review => ({\n  place_name: placeData.name,\n  address: placeData.formatted_address,\n  rating: placeData.rating,\n  total_reviews: placeData.user_ratings_total,\n  photo_url: photoUrl,\n  website: placeData.website || null,\n  phone: placeData.formatted_phone_number || null,\n  review: {\n    author_name: review.author_name,\n    rating: review.rating,\n    text: review.text,\n    relative_time_description: review.relative_time_description\n  }\n}));"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -1664,
+        -144
+      ],
+      "id": "2181507a-9960-48f4-931e-ce0b5f3dfd56",
+      "name": "All Reviews",
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// Split Reviews For AI: Convert aggregated data into individual review items for AI processing\nconst aggregated = $input.all()[0]?.json || {};\nconst reviews = Array.isArray(aggregated.all_reviews) ? aggregated.all_reviews : [];\n\nreturn reviews.map((r, idx) => ({\n  __place__: {\n    place_name: aggregated.place_name || r.place_name || '',\n    address: aggregated.address || '',\n    rating: aggregated.rating || 0,\n    total_reviews: aggregated.total_reviews || 0\n  },\n  __index__: idx,\n  place_name: aggregated.place_name || r.place_name || '',\n  author_name: r.author_name || '',\n  rating: r.rating || 0,\n  text: r.text || '',\n  sentiment: r.sentiment || 'Not Analyzed',\n  sentiment_score: r.sentiment_score ?? null,\n  relative_time_description: r.relative_time_description || ''\n}));"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -480,
+        -144
+      ],
+      "id": "0355b807-cfa7-4db1-85d0-8657a37b53ba",
+      "name": "Split Reviews For AI"
+    },
+    {
+      "parameters": {
+        "promptType": "define",
+        "text": "=أنت محلل متخصص في تحليل مراجعات العملاء باللغة العربية. مهمتك تحليل المراجعة التالية واستخراج معلومات منظمة.\n\n**معلومات المكان:**\nالاسم: {{ $json.__place__.place_name }}\nالعنوان: {{ $json.__place__.address }}\nالتقييم العام: {{ $json.__place__.rating }}/5\n\n**المراجعة للتحليل:**\nالكاتب: {{ $json.author_name }}\nالتقييم: {{ $json.rating }}/5\nالوقت: {{ $json.relative_time_description }}\nالنص: {{ $json.text }}\n\n---\n\n**المطلوب:**\n\n1. **Sentiment (الانطباع):** حدد الانطباع العام (إيجابي / سلبي / محايد)\n\n2. **Main Topics (المواضيع الرئيسية):** استخرج المواضيع المذكورة وصنفها حسب الانطباع:\n   - **Positive:** مواضيع إيجابية\n   - **Negative:** مواضيع سلبية\n   - **Neutral:** مواضيع محايدة\n\n3. **Employees (الموظفين):** إذا تم ذكر أسماء موظفين، استخرجهم وصنفهم حسب السياق:\n   - **Positive:** موظفون مذكورون بشكل إيجابي (اسم → تعليق)\n   - **Negative:** موظفون مذكورون بشكل سلبي (اسم → تعليق)\n   - **Neutral:** موظفون مذكورون بشكل محايد (اسم → تعليق)\n\n---\n\n**تنسيق الإجابة (استخدم هذا التنسيق بالضبط):**\n\n**Sentiment:** [إيجابي أو سلبي أو محايد]\n\n## Main Topics\n\n**Positive:**\n- [موضوع 1]\n- [موضوع 2]\n\n**Negative:**\n- [موضوع 1]\n- [موضوع 2]\n\n**Neutral:**\n- [موضوع 1]\n\n## Employees\n\n**Positive:**\n- [اسم الموظف] → [التعليق الإيجابي]\n\n**Negative:**\n- [اسم الموظف] → [التعليق السلبي]\n\n**Neutral:**\n- [اسم الموظف] → [التعليق المحايد]\n\n---\n\n**ملاحظات:**\n- إذا لم يكن هناك نص للمراجعة، اكتب: **Sentiment:** محايد ولا تذكر مواضيع أو موظفين\n- إذا لم يتم ذكر موظفين، لا تكتب قسم Employees\n- ركز على المعلومات الواردة في النص فقط\n- استخدم اللغة العربية في التحليل",
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 2.2,
+      "position": [
+        -256,
+        -144
+      ],
+      "id": "9ca47d46-0cc2-49f6-a7aa-5d6416377c41",
+      "name": "AI Agent"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Attach AI Metadata: Parse AI output and attach structured data to each review\nconst inputs = $input.all();\n\nlet items;\nif (inputs.length === 1 && Array.isArray(inputs[0].json)) {\n  items = inputs[0].json;\n} else {\n  items = inputs.map(i => i.json);\n}\n\nfunction parseOne(outputText) {\n  const text = outputText || '';\n  const lines = String(text).split(/\\r?\\n/).map(l => l.trim()).filter(Boolean);\n\n  const findLine = (re) => lines.find(l => re.test(l)) || '';\n\n  // Sentiment (flat)\n  const sentimentLine = findLine(/^(\\*\\*\\s*)?(Sentiment|الانطباع|النوع)/i);\n  let sentiment = '';\n  if (sentimentLine) {\n    const idx = sentimentLine.indexOf(':');\n    if (idx !== -1) sentiment = sentimentLine.slice(idx + 1).replace(/\\*/g, '').trim();\n  }\n\n  // Headers (support both EN/AR and \"Top ...\")\n  const topicsHeader = /(Main\\s*Topics|Top\\s*Topics|المواضيع\\s*الرئيسية)/i;\n  const employeesHeader = /(Employees|Top\\s*Employees|الموظفين)/i;\n\n  // Flat Topics/Employees fallback\n  const topics = [];\n  const tStart = lines.findIndex(l => topicsHeader.test(l));\n  const eStart = lines.findIndex(l => employeesHeader.test(l));\n  if (tStart !== -1) {\n    const end = eStart !== -1 ? eStart : lines.length;\n    for (let i = tStart + 1; i < end; i++) {\n      const li = lines[i];\n      if (/^(-|•|⦁)/.test(li)) topics.push(li.replace(/^(-|•|⦁)\\s*/, ''));\n    }\n  }\n  const employees = [];\n  if (eStart !== -1) {\n    for (let i = eStart + 1; i < lines.length; i++) {\n      const li = lines[i];\n      if (!/^(-|•|⦁)/.test(li)) continue;\n      const row = li.replace(/^(-|•|⦁)\\s*/, '');\n      let name = '', comment = '';\n      if (row.includes('→')) { [name, comment] = row.split('→'); }\n      else if (row.includes(':')) { [name, comment] = row.split(':'); }\n      else { name = row; comment = ''; }\n      name = (name || '').trim(); comment = (comment || '').trim();\n      if (name) employees.push({ name, comment });\n    }\n  }\n\n  // Grouped parsing for Positive/Negative/Neutral blocks under the headers\n  function parseGrouped(startRegex) {\n    const start = lines.findIndex(l => startRegex.test(l));\n    const res = { positive: [], negative: [], neutral: [] };\n    if (start === -1) return res;\n    let mode = '';\n    for (let i = start + 1; i < lines.length; i++) {\n      const li = lines[i];\n      if (/^\\*\\*\\s*Positive\\s*:?\\s*\\*\\*|^\\*\\*\\s*إيجابي|^\\*\\*\\s*إيجابية/.test(li)) { mode = 'positive'; continue; }\n      if (/^\\*\\*\\s*Negative\\s*:?\\s*\\*\\*|^\\*\\*\\s*سلبي|^\\*\\*\\s*سلبية/.test(li)) { mode = 'negative'; continue; }\n      if (/^\\*\\*\\s*Neutral\\s*:?\\s*\\*\\*|^\\*\\*\\s*محايد|^\\*\\*\\s*محايدة/.test(li)) { mode = 'neutral'; continue; }\n      if (/^##|^#\\s/.test(li)) break;\n      if (/^(-|•|⦁)/.test(li) && mode) {\n        const value = li.replace(/^(-|•|⦁)\\s*/, '');\n        res[mode].push(value);\n      }\n    }\n    return res;\n  }\n\n  function parseEmployeesGrouped(startRegex) {\n    const start = lines.findIndex(l => startRegex.test(l));\n    const res = { positive: [], negative: [], neutral: [] };\n    if (start === -1) return res;\n    let mode = '';\n    for (let i = start + 1; i < lines.length; i++) {\n      const li = lines[i];\n      if (/^\\*\\*\\s*Positive\\s*:?\\s*\\*\\*|^\\*\\*\\s*إيجابي|^\\*\\*\\s*إيجابية/.test(li)) { mode = 'positive'; continue; }\n      if (/^\\*\\*\\s*Negative\\s*:?\\s*\\*\\*|^\\*\\*\\s*سلبي|^\\*\\*\\s*سلبية/.test(li)) { mode = 'negative'; continue; }\n      if (/^\\*\\*\\s*Neutral\\s*:?\\s*\\*\\*|^\\*\\*\\s*محايد|^\\*\\*\\s*محايدة/.test(li)) { mode = 'neutral'; continue; }\n      if (/^##|^#\\s/.test(li)) break;\n      if (/^(-|•|⦁)/.test(li) && mode) {\n        const row = li.replace(/^(-|•|⦁)\\s*/, '');\n        let name = '', comment = '';\n        if (row.includes('→')) { [name, comment] = row.split('→'); }\n        else if (row.includes(':')) { [name, comment] = row.split(':'); }\n        else { name = row; comment = ''; }\n        name = (name || '').trim(); comment = (comment || '').trim();\n        if (name) res[mode].push({ name, comment });\n      }\n    }\n    return res;\n  }\n\n  const topics_by_sentiment = parseGrouped(topicsHeader);\n  const employees_by_sentiment = parseEmployeesGrouped(employeesHeader);\n\n  return { ai_analysis: text, ai_parsed: { sentiment, topics, employees, topics_by_sentiment, employees_by_sentiment } };\n}\n\nreturn items.map(it => {\n  const parsed = parseOne(it.output || '');\n  return { ...it, ...parsed };\n});"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        80,
+        -144
+      ],
+      "id": "b93e9fc7-eb19-4fc5-9015-237d442d3479",
+      "name": "Attach AI Metadata"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build Final Response: Merge original aggregation with AI-enriched reviews and compute AI summary\nconst aiItems = $input.all().map(i => i.json);\nconst aggregated = ($items('Review Analysis', 0)[0] || {}).json || {};\n\nconst enriched_reviews = aiItems.map(r => ({\n  author_name: r.author_name,\n  rating: r.rating,\n  text: r.text,\n  relative_time_description: r.relative_time_description,\n  sentiment: r.sentiment,\n  sentiment_score: r.sentiment_score,\n  ai_analysis: r.ai_analysis,\n  ai_parsed: r.ai_parsed || null\n}));\n\n// Aggregate AI parsed data (flat)\nconst sentiments_count = {};\nconst topicCount = new Map();\nconst employeeCount = new Map();\n\nenriched_reviews.forEach(r => {\n  const p = r.ai_parsed || {};\n  if (p.sentiment) {\n    const key = String(p.sentiment).trim();\n    sentiments_count[key] = (sentiments_count[key] || 0) + 1;\n  }\n  (p.topics || []).forEach(t => {\n    const k = String(t).trim();\n    if (!k) return;\n    topicCount.set(k, (topicCount.get(k) || 0) + 1);\n  });\n  (p.employees || []).forEach(e => {\n    const name = String(e.name || '').trim();\n    const comment = String(e.comment || '').trim();\n    if (!name) return;\n    const entry = employeeCount.get(name) || { name, count: 0, sample_comments: [] };\n    entry.count += 1;\n    if (comment && entry.sample_comments.length < 3) entry.sample_comments.push(comment);\n    employeeCount.set(name, entry);\n  });\n});\n\nconst top_topics = Array.from(topicCount.entries())\n  .sort((a,b) => b[1]-a[1])\n  .map(([topic, count]) => ({ topic, count }));\n\nconst top_employees = Array.from(employeeCount.values())\n  .sort((a,b) => b.count - a.count);\n\nconst ai_summary = {\n  total_reviews_enriched: enriched_reviews.length,\n  sentiments_count,\n  top_topics,\n  top_employees\n};\n\n// Aggregate AI parsed data (grouped by sentiment)\nconst bySentiment = () => ({ positive:new Map(), negative:new Map(), neutral:new Map() });\nconst groupedTopicMaps = bySentiment();\nconst groupedEmployeeMaps = bySentiment();\n\nfunction addGroupedCount(map, sentiment, key) {\n  if (!map[sentiment]) map[sentiment] = new Map();\n  map[sentiment].set(key, (map[sentiment].get(key) || 0) + 1);\n}\n\nenriched_reviews.forEach(r => {\n  const p = r.ai_parsed || {};\n  const tbs = p.topics_by_sentiment || {};\n  (tbs.positive || []).forEach(t => addGroupedCount(groupedTopicMaps, 'positive', String(t).trim()));\n  (tbs.negative || []).forEach(t => addGroupedCount(groupedTopicMaps, 'negative', String(t).trim()));\n  (tbs.neutral  || []).forEach(t => addGroupedCount(groupedTopicMaps, 'neutral',  String(t).trim()));\n\n  const ebs = p.employees_by_sentiment || {};\n  ['positive', 'negative', 'neutral'].forEach(sentimentKey => {\n    (ebs[sentimentKey] || []).forEach(({name, comment}) => {\n      const n = String(name||'').trim(); if (!n) return;\n      const cur = groupedEmployeeMaps[sentimentKey].get(n) || { name:n, count:0, sample_comments:[] };\n      cur.count += 1; if (!cur.sample_comment && comment) cur.sample_comment = String(comment).trim();\n      groupedEmployeeMaps[sentimentKey].set(n, cur);\n    });\n  });\n});\n\nconst toGroupedArr = (map) => Array.from(map.entries()).sort((a,b)=>b[1]-a[1]).map(([topic,count])=>({topic,count}));\nconst groupedTopics = {\n  positive: toGroupedArr(groupedTopicMaps.positive),\n  negative: toGroupedArr(groupedTopicMaps.negative),\n  neutral:  toGroupedArr(groupedTopicMaps.neutral),\n};\nconst toGroupedEmp = (map) => Array.from(map.values()).sort((a,b)=>b.count-a.count);\nconst groupedEmployees = {\n  positive: toGroupedEmp(groupedEmployeeMaps.positive),\n  negative: toGroupedEmp(groupedEmployeeMaps.negative),\n  neutral:  toGroupedEmp(groupedEmployeeMaps.neutral),\n};\n\nconst ai_summary_grouped = {\n  topics: groupedTopics,\n  employees: groupedEmployees,\n};\n\nreturn {\n  ...aggregated,\n  enriched_reviews,\n  ai_summary,\n  ai_summary_grouped\n};"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        304,
+        -144
+      ],
+      "id": "d0d1b0ac-0c25-412e-a3fb-d7ce8f9d3517",
+      "name": "Build Final Response"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "value": "gpt-4o",
+          "mode": "list",
+          "cachedResultName": "gpt-4o"
+        },
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.2,
+      "position": [
+        -256,
+        96
+      ],
+      "id": "cf6353fe-70c0-4021-a49b-871a23b4853d",
+      "name": "OpenAI Chat Model",
+      "credentials": {
+        "openAiApi": {
+          "id": "oSswjLSNMoEk56Hq",
+          "name": "OpenAi account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "places-autocomplete-sentiments",
+        "responseMode": "responseNode",
+        "options": {
+          "allowedOrigins": "*",
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Access-Control-Allow-Origin",
+                "value": "*"
+              },
+              {
+                "name": "Access-Control-Allow-Methods",
+                "value": "POST, OPTIONS, GET"
+              },
+              {
+                "name": "Access-Control-Allow-Headers",
+                "value": "Content-Type"
+              }
+            ]
+          }
+        }
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -1360,
+        288
+      ],
+      "id": "d028e5f8-df90-46cd-8a8a-b8f73cfa61c5",
+      "name": "Webhook Autocomplete",
+      "webhookId": "d61a233b-8f56-405c-9de3-aa20a5c03adc"
+    },
+    {
+      "parameters": {
+        "url": "https://maps.googleapis.com/maps/api/place/autocomplete/json",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "input",
+              "value": "={{ $json.body.query }}"
+            },
+            {
+              "name": "types",
+              "value": "establishment"
+            },
+            {
+              "name": "key",
+              "value": "={{ $env.GOOGLE_PLACES_API_KEY }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -656,
+        288
+      ],
+      "id": "b7be3ff8-5e48-40de-bd2f-a7f832e8ea44",
+      "name": "HTTP Autocomplete"
+    },
+    {
+      "parameters": {
+        "jsCode": "const preds = ($input.all()[0].json.predictions || []).slice(0, 8).map(p => ({ description: p.description, place_id: p.place_id }));\nreturn { predictions: preds };"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -416,
+        288
+      ],
+      "id": "6db25042-142b-4e80-a189-e7b423d3be95",
+      "name": "Map Predictions"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        64,
+        288
+      ],
+      "id": "ae66ef63-ec6d-4144-9b8f-cf3ed99e95fe",
+      "name": "Respond Autocomplete"
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "place-search-sentiments",
+        "responseMode": "responseNode",
+        "options": {
+          "allowedOrigins": "*",
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Access-Control-Allow-Origin",
+                "value": "*"
+              },
+              {
+                "name": "Access-Control-Allow-Methods",
+                "value": "POST, OPTIONS, GET"
+              },
+              {
+                "name": "Access-Control-Allow-Headers",
+                "value": "Content-Type"
+              }
+            ]
+          }
+        }
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -1088,
+        464
+      ],
+      "id": "dc50e18a-f998-4cb9-b823-15cd10c56a7e",
+      "name": "Webhook Place Search",
+      "webhookId": "c3631a0d-adcf-4648-a587-2b4be85fb2f0"
+    },
+    {
+      "parameters": {
+        "url": "https://maps.googleapis.com/maps/api/place/textsearch/json",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "query",
+              "value": "={{ $json.body.query }}"
+            },
+            {
+              "name": "key",
+              "value": "={{ $env.GOOGLE_PLACES_API_KEY }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -656,
+        464
+      ],
+      "id": "0510290e-0474-44a8-abbd-0572bd2a2394",
+      "name": "HTTP Place Search"
+    },
+    {
+      "parameters": {
+        "jsCode": "const results = $input.all()[0].json.results || [];\nreturn { results: results.slice(0, 8).map(r => ({ name: r.name, place_id: r.place_id, formatted_address: r.formatted_address })) };"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -432,
+        464
+      ],
+      "id": "b946d9b8-4d7f-4934-9e52-e5589572c3f7",
+      "name": "Map Place Results"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1,
+      "position": [
+        32,
+        464
+      ],
+      "id": "c30cbac9-77f3-47f9-9573-4d60c1a2e0c7",
+      "name": "Respond Place Search"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "HTTP Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP Request": {
+      "main": [
+        [
+          {
+            "node": "All Reviews",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sentiments Analysis": {
+      "main": [
+        [
+          {
+            "node": "MetaData",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Iterate over reviews": {
+      "main": [
+        [
+          {
+            "node": "JsonBodyAnalyzeText",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Review Analysis": {
+      "main": [
+        [
+          {
+            "node": "Split Reviews For AI",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "JsonBodyAnalyzeText": {
+      "main": [
+        [
+          {
+            "node": "Sentiments Analysis",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "MetaData": {
+      "main": [
+        [
+          {
+            "node": "Review Analysis",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "All Reviews": {
+      "main": [
+        [
+          {
+            "node": "Iterate over reviews",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Split Reviews For AI": {
+      "main": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AI Agent": {
+      "main": [
+        [
+          {
+            "node": "Attach AI Metadata",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attach AI Metadata": {
+      "main": [
+        [
+          {
+            "node": "Build Final Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Final Response": {
+      "main": [
+        [
+          {
+            "node": "Respond to Webhook",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "OpenAI Chat Model": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "AI Agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook Autocomplete": {
+      "main": [
+        [
+          {
+            "node": "HTTP Autocomplete",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP Autocomplete": {
+      "main": [
+        [
+          {
+            "node": "Map Predictions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Map Predictions": {
+      "main": [
+        [
+          {
+            "node": "Respond Autocomplete",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook Place Search": {
+      "main": [
+        [
+          {
+            "node": "HTTP Place Search",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP Place Search": {
+      "main": [
+        [
+          {
+            "node": "Map Place Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Map Place Results": {
+      "main": [
+        [
+          {
+            "node": "Respond Place Search",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "versionId": "72005ffb-6be0-4b5e-b7ca-524db5efbfa8",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "7f513d0e44e80f464ae1b9f1b06d02cbb15cf326420d3a3d31580ea9f40f19b7"
+  },
+  "id": "AZl8YkB8lOyFG3V7",
+  "tags": []
+}
